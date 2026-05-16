@@ -1,57 +1,80 @@
 import onnxruntime
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image
-import tkinter as tk
-from tkinter import filedialog
-import sys
 import os
+import time
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-MODEL_PATH   = "shoe_detector_nano.onnx"
-INPUT_W      = 416
-INPUT_H      = 416
-CONF_THRESH  = 0.25
-NMS_THRESH   = 0.45
-CLASS_NAMES  = ["shoe", "shoe-alt"]  # must match your training classes
+MODEL_PATH  = "person_detector.onnx"
+INPUT_W     = 640
+INPUT_H     = 640
+CONF_THRESH = 0.45
+NMS_THRESH  = 0.45
+BOX_COLOR   = (0, 200, 255)
+TEXT_COLOR  = (255, 255, 255)
 
-# ── Load model ────────────────────────────────────────────────────────────────
-print(f"Loading model: {MODEL_PATH}")
-session = onnxruntime.InferenceSession(
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana",
+    "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
+    "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table",
+    "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock",
+    "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+]
+
+# Only detect these — change to set() to detect all 80 COCO classes
+FILTER_CLASSES = {"person"}
+
+# ── Load model ─────────────────────────────────────────────────────────────────
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model not found: {MODEL_PATH}\n"
+        "Make sure person_detector.onnx is in the same folder as detect.py"
+    )
+
+print(f"Loading {MODEL_PATH}...")
+session     = onnxruntime.InferenceSession(
     MODEL_PATH,
     providers=["CPUExecutionProvider"]
 )
-input_name = session.get_inputs()[0].name
-print("Model loaded successfully.\n")
+input_name  = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+print("Model loaded. Press Q or ESC to quit.\n")
 
 # ── Pre-processing ─────────────────────────────────────────────────────────────
-def preprocess(image_path):
-    img_orig = cv2.imread(image_path)
-    if img_orig is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
-
-    img = cv2.resize(img_orig, (INPUT_W, INPUT_H))
+def preprocess(frame):
+    img = cv2.resize(frame, (INPUT_W, INPUT_H))
     img = img[:, :, ::-1].astype(np.float32)   # BGR → RGB
     img /= 255.0
     img = np.transpose(img, (2, 0, 1))          # HWC → CHW
     img = np.expand_dims(img, axis=0)            # → 1xCxHxW
-    return np.ascontiguousarray(img), img_orig
+    return np.ascontiguousarray(img)
 
 # ── Post-processing ────────────────────────────────────────────────────────────
-def postprocess(outputs, orig_w, orig_h):
-    raw = outputs[0].reshape(-1, 5 + len(CLASS_NAMES))
+def postprocess(output, orig_w, orig_h):
+    raw = output[0]
+
+    if raw.ndim == 3:
+        raw = raw[0]   # [84, num_boxes]
+        raw = raw.T    # [num_boxes, 84]
+
     boxes, scores, class_ids = [], [], []
 
     for det in raw:
-        obj_conf = float(det[4])
-        if obj_conf < CONF_THRESH:
-            continue
-        cls_scores = det[5:] * obj_conf
-        cls_id     = int(np.argmax(cls_scores))
-        score      = float(cls_scores[cls_id])
+        class_scores = det[4:]
+        cls_id       = int(np.argmax(class_scores))
+        score        = float(class_scores[cls_id])
+
         if score < CONF_THRESH:
+            continue
+
+        if FILTER_CLASSES and COCO_CLASSES[cls_id] not in FILTER_CLASSES:
             continue
 
         cx, cy, w, h = det[:4]
@@ -60,9 +83,11 @@ def postprocess(outputs, orig_w, orig_h):
         x2 = int((cx + w / 2) * orig_w / INPUT_W)
         y2 = int((cy + h / 2) * orig_h / INPUT_H)
 
-        # Clamp to image bounds
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(orig_w, x2), min(orig_h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
 
         boxes.append([x1, y1, x2 - x1, y2 - y1])
         scores.append(score)
@@ -78,85 +103,87 @@ def postprocess(outputs, orig_w, orig_h):
 
     return detections
 
-# ── Draw and display ───────────────────────────────────────────────────────────
-def draw_and_show(image_path, detections, orig_img):
-    orig_rgb = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f"Shoe Detector — {os.path.basename(image_path)}", fontsize=13)
-
-    # Original
-    axes[0].imshow(orig_rgb)
-    axes[0].set_title("Original")
-    axes[0].axis("off")
-
-    # Prediction
-    axes[1].imshow(orig_rgb)
-    axes[1].set_title(f"Prediction — {len(detections)} shoe(s) detected")
-    axes[1].axis("off")
-
+# ── Draw bounding boxes ────────────────────────────────────────────────────────
+def draw_detections(frame, detections):
     for (x1, y1, x2, y2, conf, cls_id) in detections:
-        label = f"{CLASS_NAMES[cls_id]} {conf:.0%}"
-        rect  = patches.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1,
-            linewidth=2, edgecolor="#00ff55", facecolor="none"
+        label = f"{COCO_CLASSES[cls_id]} {conf:.0%}"
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(
+            frame,
+            (x1, y1 - th - 10), (x1 + tw + 6, y1),
+            BOX_COLOR, -1
         )
-        axes[1].add_patch(rect)
-        axes[1].text(
-            x1, max(y1 - 6, 10), label,
-            color="white", fontsize=9, fontweight="bold",
-            bbox=dict(facecolor="#00ff55", alpha=0.7, pad=2, edgecolor="none")
+        cv2.putText(
+            frame, label, (x1 + 3, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_COLOR, 2
         )
+    return frame
 
-    plt.tight_layout()
-    plt.show()
+# ── HUD ───────────────────────────────────────────────────────────────────────
+def draw_hud(frame, fps, num_detections):
+    h, w = frame.shape[:2]
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-def print_summary(detections):
-    print("\n" + "=" * 45)
-    print("         DETECTION SUMMARY")
-    print("=" * 45)
-    if detections:
-        print(f"  Shoes detected: {len(detections)}\n")
-        for i, (x1, y1, x2, y2, conf, cls_id) in enumerate(detections, 1):
-            print(f"  [{i}] {CLASS_NAMES[cls_id]:<12} confidence: {conf:.1%}")
-            print(f"       box: ({x1}, {y1}) → ({x2}, {y2})")
-    else:
-        print("  No shoes detected.")
-        print("  Try lowering CONF_THRESH (e.g. 0.25) if you expected a detection.")
-    print("=" * 45 + "\n")
+    cv2.putText(frame, f"FPS: {fps:.1f}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    label      = f"People: {num_detections}"
+    color      = BOX_COLOR if num_detections > 0 else (100, 100, 100)
+    (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    cv2.putText(frame, label,
+                (w - tw - 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    cv2.putText(frame, "Q / ESC to quit",
+                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    return frame
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    # If an image path is passed as argument, use it
-    # Otherwise open a file picker dialog
-    if len(sys.argv) > 1:
-        image_path = sys.argv[1]
-    else:
-        print("Opening file picker — select an image...")
-        root = tk.Tk()
-        root.withdraw()  # hide the empty tkinter window
-        image_path = filedialog.askopenfilename(
-            title="Select an image",
-            filetypes=[
-                ("Image files", "*.jpg *.jpeg *.png *.webp *.bmp"),
-                ("All files",   "*.*")
-            ]
-        )
-        root.destroy()
+    # 0 = default webcam — change to 1 or 2 if the wrong camera opens
+    cap = cv2.VideoCapture(0)
 
-    if not image_path:
-        print("No image selected. Exiting.")
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam.")
+        print("Try changing VideoCapture(0) to VideoCapture(1)")
         return
 
-    print(f"Running inference on: {image_path}")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    inp, orig_img    = preprocess(image_path)
-    outputs          = session.run(None, {input_name: inp})
-    orig_h, orig_w   = orig_img.shape[:2]
-    detections       = postprocess(outputs, orig_w, orig_h)
+    print("Webcam opened — starting detection loop...")
+    prev_time = time.time()
 
-    print_summary(detections)
-    draw_and_show(image_path, detections, orig_img)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame.")
+            break
+
+        orig_h, orig_w = frame.shape[:2]
+
+        inp        = preprocess(frame)
+        outputs    = session.run([output_name], {input_name: inp})
+        detections = postprocess(outputs, orig_w, orig_h)
+
+        frame = draw_detections(frame, detections)
+
+        curr_time = time.time()
+        fps       = 1.0 / (curr_time - prev_time + 1e-9)
+        prev_time = curr_time
+
+        frame = draw_hud(frame, fps, len(detections))
+
+        cv2.imshow("Person Detector — Webcam", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), ord("Q"), 27):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Done.")
 
 if __name__ == "__main__":
     main()
